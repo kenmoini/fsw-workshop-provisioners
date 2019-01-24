@@ -1,0 +1,7 @@
+---
+- hosts: localhost
+  gather_facts: false
+  name: 'FSW Data Science 101 Workshop Provisioner - Create Environments'
+
+  roles:
+    - fsw-aws-create-rh-idm
