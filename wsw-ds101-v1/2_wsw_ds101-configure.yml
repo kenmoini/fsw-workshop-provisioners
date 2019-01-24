@@ -1,0 +1,127 @@
+---
+- hosts: aws_cbd_hosts
+  name: 'Workshop Worker - Hortonworks Data Science 101 - Step 2: We fold the Stacks'
+
+  tasks:
+
+    - name: Include the shared variables
+      include_vars:
+        file: wsw_ds101-vars.yml
+
+    - name: 'Upload the CBD credential template files'
+      template:
+        src: cbd-aws-credentials.json.j2
+        dest: cbd-aws-credentials.json
+        mode: 0777
+      with_items:
+        - { credential_name: '{{ cbd_aws_credential_name }}', credential_description: '{{ cbd_aws_credential_description }}', access_key: '{{ cbd_aws_credential_access_key }}', secret_key: '{{ cbd_aws_credential_secret_key }}' }
+
+    - name: Amazon Linux - Install or update yum-utils
+      package:
+        name: yum-utils
+        state: latest
+      become: yes
+
+    - name: Amazon Linux - Enable the EPEL Repo
+      shell: yum-config-manager --enable epel*
+      become: yes
+
+    - name: Install CertBot
+      get_url:
+        url: https://dl.eff.org/certbot-auto
+        dest: /usr/bin/certbot-auto
+        mode: 0755
+      become: yes
+
+    - name: Shutdown CBD
+      command: "cbd kill"
+      args:
+        chdir: /var/lib/cloudbreak-deployment
+      become: yes
+
+    - name: Prime the certbot pump since this is AMZ Linux
+      command: certbot-auto --no-bootstrap
+      register: prime_certbot
+      failed_when: "prime_certbot.rc != 0 and 'certbot-auto certonly' not in prime_certbot.stderr"
+      become: yes
+
+    - name: Create certificates with CertBot
+      command: "certbot-auto certonly --no-bootstrap --standalone --no-eff-email --register-unsafely-without-email --agree-tos -d {{ hostvars[inventory_hostname]['cbd_fqdn'] }}"
+      become: yes
+      register: create_certificate
+      failed_when: "create_certificate.rc != 0 and 'not yet due for renewal' not in create_certificate.stderr"
+
+    - name: Backup old SSL certs
+      copy:
+        src: /var/lib/cloudbreak-deployment/certs/traefik/{{ item }}.pem
+        dest: /var/lib/cloudbreak-deployment/certs/traefik/{{ item }}-{{ lookup('pipe', 'date +%s') }}.pem
+        remote_src: True
+      with_items:
+        - client
+        - client-key
+        - client-ca
+      become: yes
+
+    - name: Make the certificate directory
+      file:
+        path: /var/lib/cloudbreak-deployment/certs/traefik
+        state: directory
+      become: yes
+
+    - name: Copy CA Chain into directory
+      copy:
+        src: "/etc/letsencrypt/live/{{ hostvars[inventory_hostname]['cbd_fqdn'] }}/fullchain.pem"
+        dest: /var/lib/cloudbreak-deployment/certs/traefik/client-ca.pem
+        remote_src: True
+      become: yes
+
+    - name: Copy SSL Cert into directory
+      copy:
+        src: "/etc/letsencrypt/live/{{ hostvars[inventory_hostname]['cbd_fqdn'] }}/cert.pem"
+        dest: /var/lib/cloudbreak-deployment/certs/traefik/client.pem
+        remote_src: True
+      become: yes
+
+    - name: Copy SSL Key into directory
+      copy:
+        src: "/etc/letsencrypt/live/{{ hostvars[inventory_hostname]['cbd_fqdn'] }}/privkey.pem"
+        dest: /var/lib/cloudbreak-deployment/certs/traefik/client-key.pem
+        remote_src: True
+      become: yes
+
+    - name: Set Permissions on files
+      file:
+        path: /var/lib/cloudbreak-deployment/certs/traefik/{{ item }}.pem
+        mode: 0700
+        owner: cloudbreak
+        group: cloudbreak
+      with_items:
+        - client
+        - client-key
+        - client-ca
+      become: yes
+
+    - name: Replace CBD Profile Hostname
+      lineinfile:
+        path: /var/lib/cloudbreak-deployment/Profile
+        regexp: '^export PUBLIC_IP'
+        line: "export PUBLIC_IP={{ hostvars[inventory_hostname]['cbd_fqdn'] }}"
+      become: yes
+
+    - name: Regenerate CBD docker config
+      command: "cbd regenerate"
+      become: yes
+      args:
+        chdir: /var/lib/cloudbreak-deployment
+
+    - name: Start CBD
+      command: "cbd start-wait"
+      args:
+        chdir: /var/lib/cloudbreak-deployment
+      become: yes
+
+    - name: Connect to CBD Hosts and install credentials with CB CLI
+      command: "cb credential create from-file --cli-input-json cbd-aws-credentials.json --name {{ cbd_aws_credential_slug }} --server {{ hostvars[inventory_hostname]['cbd_fqdn'] }} --username student-{{ hostvars[inventory_hostname]['inv_count'] }}@{{ workshop_prefix }}.{{ workshop_domain }} --password student-{{ hostvars[inventory_hostname]['inv_count'] }}"
+      register: credentials_installed
+      become: yes
+      failed_when: "credentials_installed.rc != 0 and 'duplicate key value' not in credentials_installed.stderr"

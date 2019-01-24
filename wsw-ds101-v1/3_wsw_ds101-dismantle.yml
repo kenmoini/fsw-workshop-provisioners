@@ -1,0 +1,108 @@
+---
+- hosts: localhost
+  gather_facts: false
+  name: 'Workshop Worker - Hortonworks Data Science 101 - Step 3: Burn the Stacks down'
+
+  tasks:
+
+    - name: Include the shared variables
+      include_vars:
+        file: wsw_ds101-vars.yml
+
+    - name: Checking environment
+      stat:
+        path: "{{ working_dir }}"
+      register: check_env
+
+    - name: Testing environment...
+      fail:
+        msg: "Seems like there's no workshop currently built?"
+      when: check_env.stat.isdir is not defined
+
+    - name: Delete CloudFormation Stacks
+      cloudformation:
+        stack_name: "{{ item }}"
+        state: absent
+      with_lines: cat "{{ stack_list_file }}"
+      async: 30
+      poll: 0
+
+    - name: Read in endpoint list
+      include_vars:
+        file: "{{ endpoint_file }}"
+        name: pulled_end_points
+
+    - name: Delete R53 CBD A Records
+      route53:
+        state: absent
+        zone: "{{ item.value.record_zone }}"
+        record: "{{ item.value.record_name }}.{{ item.value.record_zone }}."
+        ttl: "{{ item.value.record_ttl }}"
+        type: "{{ item.value.record_type }}"
+        value: "{{ item.value.record_value }}"
+      loop: "{{ lookup('dict', pulled_end_points.com_endpoints, wantlist=True ) }}"
+      ignore_errors: True
+
+    - name: Delete Route 53 Zone
+      route53_zone:
+        zone: "{{ workshop_prefix }}.{{ workshop_domain }}"
+        state: absent
+
+    - name: Get R53 NS Record Info
+      route53:
+        state: get
+        zone: "{{ workshop_domain }}"
+        record: "{{ workshop_prefix }}.{{ workshop_domain }}"
+        type: NS
+      register: r53NS
+
+    - name: Delete R53 NS Record from parent zone
+      route53:
+        state: absent
+        zone: "{{ workshop_domain }}"
+        record: "{{ r53NS.set.record }}"
+        type: "{{  r53NS.set.type }}"
+        ttl: "{{  r53NS.set.ttl }}"
+        value: "{{  r53NS.set.value }}"
+      when: (r53NS.set|length>0)
+
+    # BE AWARE THIS WILL DELETE ANY MACHINE CBD WOULD HAVE DEPLOYED IN THAT REGION
+    - name: Find EC2 Instances CBD might have deployed
+      ec2_instance_facts:
+        filters:
+          "tag-key":
+            - cb-user-name
+            - CloudbreakClusterName
+      register: aws_ec2_facts
+
+    - name: Terminate any EC2 servers CBD may have deployed
+      ec2:
+        region: "{{ item.placement.availability_zone[0:9] }}"
+        instance_ids: "{{ item.instance_id }}"
+        state: 'absent'
+      loop: "{{ aws_ec2_facts.instances }}"
+
+    # Delete the VPC IG CBD makes
+    # Delete the VPC Route Table CBD Makes
+    # Delete the EC2 Security group CBD Makes
+    # Delete the VPC CBD makes
+    # Delete the VPC Subnet CBD Makes
+
+
+    - name: Get list of EC2 Keys
+      find:
+        paths: "{{ working_dir }}"
+        patterns: "*.pem"
+        recurse: no
+      register: pemKeys
+
+    - name: Delete EC2 Keys
+      ec2_key:
+        state: absent
+        name: "{{ item.path | basename | replace('.pem','') }}"
+      loop: "{{ pemKeys.files }}"
+
+    - name: Clean up after ourselves
+      file:
+        state: absent
+        path: "{{ working_dir }}/"

@@ -1,0 +1,64 @@
+- name: SR - Get CloudFormation Stack Details
+  cloudformation_facts:
+    stack_name: "{{ item }}"
+    stack_resources: yes
+    stack_template: no
+    stack_policy: no
+    stack_events: no
+  register: cloudbreak_stacks
+  tags: ['never', 'build']
+
+- name: SR - Set facts
+  set_fact:
+    working_stack: "{{ cloudformation[item]  }}"
+  tags: ['never', 'build']
+
+- name: SR - Debug working_stack structure
+  debug:
+    msg: "{{ working_stack }}"
+  tags: ['never', 'debug']
+
+# This is used to create a composite list of all student login users
+# AWS Resources that are created by CloudBreak Deployer are tagged with this info
+# Otherwise, the clusters spun up from CBD won't be dismantled when the CBD cluster is
+- name: SR - Add student login to student directory file...
+  lineinfile:
+    path: "{{ student_directory_file }}"
+    line: "student-{{ working_stack.stack_tags.count_val }}@{{ workshop_prefix }}.{{ workshop_domain }}"
+  tags: ['never', 'build']
+
+# AWS Route53 module requires ALL the record data points to delete, including value
+# We need to create a list in order to track this data to dismantle later
+- name: SR - Manually add the endpoints to the list...
+  shell:
+    cmd: |
+      echo '  {{ item | replace('.','_') }}:' >> {{ endpoint_file }}
+      echo '    record_name: "{{ working_stack.stack_tags.prefix }}"' >> {{ endpoint_file }}
+      echo '    record_ttl: "300"' >> {{ endpoint_file }}
+      echo '    record_type: "A"' >> {{ endpoint_file }}
+      echo '    record_value: {{ working_stack.stack_outputs.SshAccess.split("@")[1] }}' >> {{ endpoint_file }}
+      echo '    record_zone: "{{ workshop_prefix }}.{{ workshop_domain }}"' >> {{ endpoint_file }}
+  tags: ['never', 'build']
+  when: working_stack.stack_description.stack_status == "CREATE_COMPLETE"
+
+# One of the things that makes this script so fast is creating an inventory file
+#  listing all of the CBD hosts we've connected to.  That way in the second script
+#  Ansible can connect to the hosts directly instead of polling any AWS modules
+- name: "SR - Manually populate the inventory file.  It's just easier this way."
+  shell:
+    cmd: |
+      echo '{{ working_stack.stack_outputs.SshAccess.split("@")[1] }} ip={{ working_stack.stack_outputs.SshAccess.split("@")[1] }} cbd_fqdn=cbd-{{ working_stack.stack_tags.count_val }}.{{ workshop_prefix }}.{{ workshop_domain }} aws_fqdn={{ working_stack.stack_outputs.CloudController | from_json | json_query("CloudURL") }} key_name={{ working_stack.stack_parameters.KeyName }} inv_count={{ working_stack.stack_tags.count_val }} ansible_ssh_extra_args="-o StrictHostKeyChecking=no" ansible_connection=ssh ansible_ssh_user=cloudbreak ansible_ssh_private_key_file={{ working_dir }}/{{ working_stack.stack_parameters.KeyName }}.pem' >> {{ inventory_file }}
+  tags: ['never', 'build']
+  when: working_stack.stack_description.stack_status == "CREATE_COMPLETE"
+
+# Here we're setting up a nicer, human friendly, FQDN under our R53 managed domain
+- name: SR - Create the subdomains for the students
+  route53:
+    state: present
+    zone: '{{ workshop_prefix }}.{{ workshop_domain }}'
+    record: '{{ working_stack.stack_tags.prefix }}.{{ workshop_prefix }}.{{ workshop_domain }}'
+    type: A
+    ttl: 300
+    value: '{{ working_stack.stack_outputs.SshAccess.split("@")[1] }}'
+    wait: no
+  tags: ['never', 'build']

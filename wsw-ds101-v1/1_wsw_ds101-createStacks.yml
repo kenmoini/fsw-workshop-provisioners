@@ -1,0 +1,178 @@
+---
+- hosts: localhost
+  gather_facts: False
+  name: 'Workshop Worker - Hortonworks Data Science 101 - Step 1: We make the Stacks'
+
+  tasks:
+    - name: Include the shared variables
+      include_vars:
+        file: wsw_ds101-vars.yml
+      tags: ['build']
+
+    - name: Create working directory
+      file:
+        name: "{{ working_dir }}"
+        state: directory
+        mode: 0700
+      tags: ['build']
+
+    - name: Dump any previous inventory files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "{{ inventory_file }}"
+        - "{{ stack_list_file }}"
+        - "{{ endpoint_file }}"
+        - "{{ student_directory_file }}"
+      tags: ['build']
+
+    - name: Create Inventory File
+      lineinfile:
+        path: "{{ inventory_file }}"
+        line: "[aws_cbd_hosts]"
+        create: yes
+      tags: ['build']
+
+    - name: Create Endpoint, Stack, and User Directory files
+      file:
+        state: touch
+        path: "{{ item }}"
+      with_items:
+        - "{{ endpoint_file }}"
+        - "{{ stack_list_file }}"
+        - "{{ student_directory_file }}"
+      tags: ['build']
+
+    - name: Inititalize endpoint file
+      shell:
+        cmd: |
+          echo 'com_endpoints:' > {{ endpoint_file }}
+      tags: ['never', 'build']
+
+    - name: Create containing Route53 Zone for workshop_prefix.workshop_domain
+      route53_zone:
+        zone: '{{ workshop_prefix }}.{{ workshop_domain }}'
+        comment: Workshop subdomain zone, created by Ansible Playbook
+        region: '{{ aws_region }}'
+        # register the output, feed the NS records into the next task
+      register: new_workshop_zone
+      tags: ['build']
+
+    - name: Get the new zone DNS NS info, because the route53_zone module doesn't return that data...
+      route53:
+        state: get
+        zone: '{{ workshop_prefix }}.{{ workshop_domain }}'
+        record: '{{ workshop_prefix }}.{{ workshop_domain }}'
+        type: NS
+      register: new_workshop_zone_ns
+      tags: ['build']
+
+    - name: Create the NS record in the parent zone pointing to the new sub zone
+      route53:
+        state: present
+        zone: '{{ workshop_domain }}'
+        record: '{{ workshop_prefix }}.{{ workshop_domain }}'
+        type: NS
+        ttl: 600
+        value: '{{ new_workshop_zone_ns.nameservers }}'
+        wait: no
+      tags: ['build']
+
+    - name: Create EC2 Keys for each workshop student
+      ec2_key:
+        name: '{{ workshop_prefix }}-cluster-student-{{ item }}'
+        region: '{{ aws_region }}'
+      with_sequence: start=0 count='{{ seat_count }}'
+      register: ec2_key_result
+      tags: ['build']
+
+    - name: Loop through the EC2 Key Output and store into files
+      copy:
+        dest: "{{ working_dir }}/{{ item.key.name }}.pem"
+        content: "{{ item.key.private_key }}"
+        mode: 0600
+      loop: "{{ ec2_key_result.results }}"
+      when: item.msg == 'key pair created'
+      tags: ['build']
+
+    - name: DEBUG ec2_key_result.results loop
+      debug:
+        msg: "{{ item }}"
+      loop: "{{ ec2_key_result.results }}"
+
+    - name: Create CloudBreak Deployer CloudFormation Stack, this will take a while, for each student...
+      cloudformation:
+        stack_name: "cbd-{{ item.item }}-{{ workshop_prefix }}-{{ workshop_domain | replace('.','-') }}"
+        state: present
+        region: "{{ aws_region }}"
+        disable_rollback: false
+        template_url: https://s3.amazonaws.com/cbd-quickstart/cbd-quickstart-2.7.0.template
+        template_parameters:
+          KeyName: "{{ item.key.name }}"
+          RemoteLocation: "{{ cbd_remote_location_cidr }}"
+          EmailAddress: "student-{{ item.item }}@{{ workshop_prefix }}.{{ workshop_domain }}"
+          AdminPassword: "student-{{ item.item }}"
+          InstanceType: "{{ cbd_instance_type }}"
+        tags:
+          name: "cbdHost-{{ item.item }}-{{ workshop_prefix }}-{{ workshop_domain }}"
+          environment: "workshop"
+          workshop_group: "{{ workshop_prefix }}.{{ workshop_domain }}"
+          prefix: "cbd-{{ item.item }}"
+          count_val: "{{ item.item }}"
+      loop: "{{ ec2_key_result.results }}"
+      register: cloudbreak_stacks
+      tags: ['build']
+      async: 60
+      poll: 0
+
+    - name: Create Stack List file for easy dismantling of the clusters
+      lineinfile:
+        path: "{{ stack_list_file }}"
+        #line: "[{'resource_id': {{ item.physical_resource_id }}, '' }]"
+        line: "cbd-{{ item.item }}-{{ workshop_prefix }}-{{ workshop_domain | replace('.','-') }}"
+      loop: "{{ ec2_key_result.results }}"
+      tags: ['build']
+
+    - name: Get CloudFormation Stack Details
+      cloudformation_facts:
+        stack_name: "{{ item }}"
+        stack_resources: yes
+        stack_template: no
+        stack_policy: no
+        stack_events: no
+      register: cloudbreak_stacks
+      tags: ['build', 'never']
+      with_lines: cat "{{ stack_list_file }}"
+
+    # PS: I hate AWS' cloudformation modules
+    - name: Runner
+      include: stack_runner.yml
+      with_lines: cat "{{ stack_list_file }}"
+      tags: ['build', 'never']
+      register: runner_out
+
+    - name: Where did we run to
+      debug:
+        msg: "{{ runner_out }}"
+      tags: ['build', 'never']
+
+    - name: Finished Step 1.1!
+      debug:
+        msg:
+          - "************"
+          - "****NOTE****"
+          - "************"
+          - "You have the CloudFoundation stacks being built right now.  It will take about 15 minutes for them all to finish, go have a smoke and come back to continue"
+          - "************"
+          - "Next run 'ansible-playbook 1_wsw_ds101-createStacks.yml --tags build' !"
+          - "OR"
+          - "'ansible-playbook 3_wsw_ds101-dismantle.yml' in order to dismantle the stacks!"
+
+    - name: Finished Step 1.2!
+      debug:
+        msg:
+          - "Now simply run 'ansible-playbook -i {{ inventory_file }} 2_wsw_ds101-configure.yml' !"
+          - "OR"
+          - "'ansible-playbook 3_wsw_ds101-dismantle.yml' in order to dismantle the stacks!"
+      tags: ['never', 'build']
